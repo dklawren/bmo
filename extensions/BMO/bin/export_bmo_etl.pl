@@ -31,15 +31,22 @@ use Mojo::Util qw(getopt);
 use constant API_BLOCK_COUNT => 1000;
 
 Bugzilla->usage_mode(USAGE_MODE_CMDLINE);
-getopt 't|test' => \my $test, 'v|verbose' => \my $verbose;
+getopt 't|test' => \my $test, 'v|verbose' => \my $verbose, 's|snapshot-date=s' => \my $snapshot_date;
 
-if (!Bugzilla->params->{bmo_etl_enabled}) {
-  die "BMO ETL not enabled.\n";
-}
+# Sanity checks
+Bugzilla->params->{bmo_etl_enabled} || die "BMO ETL not enabled.\n";
 
-if (!$test && !Bugzilla->params->{bmo_etl_base_url}) {
-  die "BMO ETL base url not defined.\n";
-}
+my $base_url = Bugzilla->params->{bmo_etl_base_url};
+$base_url || die "Invalid BigQuery base URL.\n";
+
+my $project_id = Bugzilla->params->{bmo_etl_project_id};
+$project_id || die "Invalid BigQuery product ID.\n";
+
+my $dataset_id = Bugzilla->params->{bmo_etl_dataset_id};
+$dataset_id || die "Invalid BigQuery dataset ID.\n";
+
+# Check to make sure another instance is not currently running
+check_and_set_lock();
 
 # Use replica if available
 my $dbh = Bugzilla->switch_to_shadow_db();
@@ -56,189 +63,204 @@ if (my $proxy = Bugzilla->params->{proxy_url}) {
 }
 
 # This date will be added to each object as it is being sent
-my $snapshot_date = $dbh->selectrow_array('SELECT LOCALTIMESTAMP(0)');
-my $file_snapshot = $snapshot_date;
-$file_snapshot =~ s/[\s:-]+/_/g;
+if (!$snapshot_date) {
+  $snapshot_date = $dbh->selectrow_array(
+    'SELECT ' . $dbh->sql_date_format('LOCALTIMESTAMP(0)', '%Y-%m-%d'));
+}
+
+# In order to avoid entering duplicate data, we will first query BigQuery
+# to make sure other entries with this date are not already present.
+check_for_duplicates();
 
 ### Bugs
 
 my $table_name = 'bugs';
-my $rows       = $dbh->selectall_arrayref(
-  'SELECT bug_id AS id, delta_ts AS modification_time FROM bugs ORDER BY bug_id',
-  {Slice => {}}
-);
+my $count      = 0;
+my $last_id    = 0;
 
-my $total = scalar @{$rows};
-my $count = 0;
+my $total = $dbh->selectrow_array('SELECT COUNT(*) FROM bugs');
+print "Processing $total $table_name.\n" if $verbose;
 
-print "Processing $total bugs.\n" if $verbose;
+my $sth
+  = $dbh->prepare(
+  'SELECT bug_id AS id, delta_ts AS modification_time FROM bugs WHERE bug_id > ? ORDER BY bug_id LIMIT '
+    . API_BLOCK_COUNT);
 
-my @results = ();
-foreach my $row (@{$rows}) {
+while ($count < $total) {
+  my @bugs = ();
 
-  # First check to see if we have a cached version with the same modification date
-  my $data = get_cache($row->{id}, $table_name, $row->{modification_time});
-  if (!$data) {
-    print "$table_name id " . $row->{id} . " not found in cache.\n" if $verbose;
+  $sth->execute($last_id);
 
-    my $obj = Bugzilla::Bug->new($row->{id});
+  while (my ($id, $mod_time) = $sth->fetchrow_array()) {
+    print "Processing id $id with mod_time of $mod_time.\n" if $verbose;
 
-    $data = {
-      id              => $obj->id,
-      assignee_id     => $obj->assigned_to->id,
-      url             => $obj->bug_file_loc,
-      severity        => $obj->bug_severity,
-      status          => $obj->bug_status,
-      type            => $obj->bug_type,
-      crash_signature => $obj->cf_crash_signature,
-      component       => $obj->component,
-      creation_ts     => $obj->creation_ts,
-      updated_ts      => $obj->delta_ts,
-      op_sys          => $obj->op_sys,
-      priority        => $obj->priority,
-      product         => $obj->product,
-      platform        => $obj->rep_platform,
-      reporter_id     => $obj->reporter->id,
-      resolution      => $obj->resolution,
-      summary         => $obj->short_desc,
-      whiteboard      => $obj->status_whiteboard,
-      milestone       => $obj->target_milestone,
-      version         => $obj->version,
-      team_name       => $obj->component_obj->team_name,
-      classification  => $obj->classification,
-      comment_count   => $obj->comment_count,
-      vote_count      => $obj->votes,
-      group           => (join ',', map { $_->name } @{$obj->groups_in}),
-      is_public       => (scalar @{$obj->groups_in} ? true : false),
-      cc_count        => scalar @{$obj->cc || []},
-    };
+    # First check to see if we have a cached version with the same modification date
+    my $data = get_cache($id, $table_name, $mod_time);
+    if (!$data) {
+      print "$table_name id $id with time $mod_time not found in cache.\n"
+        if $verbose;
 
-    # Store a copy of the data for use in later executions
-    store_cache($obj->id, $table_name, $obj->delta_ts, $data);
+      my $obj = Bugzilla::Bug->new($id);
+
+      $data = {
+        id              => $obj->id,
+        assignee_id     => $obj->assigned_to->id,
+        url             => $obj->bug_file_loc,
+        severity        => $obj->bug_severity,
+        status          => $obj->bug_status,
+        type            => $obj->bug_type,
+        crash_signature => $obj->cf_crash_signature,
+        component       => $obj->component,
+        creation_ts     => $obj->creation_ts,
+        updated_ts      => $obj->delta_ts,
+        op_sys          => $obj->op_sys,
+        priority        => $obj->priority,
+        product         => $obj->product,
+        platform        => $obj->rep_platform,
+        reporter_id     => $obj->reporter->id,
+        resolution      => $obj->resolution,
+        summary         => $obj->short_desc,
+        whiteboard      => $obj->status_whiteboard,
+        milestone       => $obj->target_milestone,
+        version         => $obj->version,
+        team_name       => $obj->component_obj->team_name,
+        classification  => $obj->classification,
+        comment_count   => $obj->comment_count,
+        vote_count      => $obj->votes,
+        group           => (join ',', map { $_->name } @{$obj->groups_in}),
+        is_public       => (scalar @{$obj->groups_in} ? true : false),
+        cc_count        => scalar @{$obj->cc || []},
+      };
+
+      # Store a copy of the data for use in later executions
+      store_cache($obj->id, $table_name, $obj->delta_ts, $data);
+    }
+
+    push @bugs, $data;
+
+    $count++;
+    $last_id = $id;
   }
 
-  push @results, $data;
-
-  $count++;
-
-  # Send the rows to the server if we have a specific sized block'
-  # or we are at the last row
-  if (scalar @results == API_BLOCK_COUNT || $total == $count) {
-    send_data($table_name, \@results, $count);
-    @results = ();
-  }
+  # Send the rows to the server
+  send_data($table_name, \@bugs, $count) if @bugs;
 }
 
 ### Attachments
 
 $table_name = 'attachments';
-$rows       = $dbh->selectall_arrayref(
-  'SELECT attach_id AS id, modification_time FROM attachments ORDER BY attach_id',
-  {Slice => {}}
-);
+$count      = 0;
+$last_id    = 0;
 
-$total = scalar @{$rows};
-$count = 0;
+$total = $dbh->selectrow_array('SELECT COUNT(*) FROM attachments');
+print "Processing $total $table_name.\n" if $verbose;
 
-print "Processing $total attachments.\n" if $verbose;
+$sth
+  = $dbh->prepare(
+  'SELECT attach_id AS id, modification_time FROM attachments WHERE attach_id > ? ORDER BY bug_id LIMIT '
+    . API_BLOCK_COUNT);
 
-@results = ();
-foreach my $row (@{$rows}) {
+while ($count < $total) {
+  my @attachments = ();
 
-  # First check to see if we have a cached version with the same modification date
-  my $data = get_cache($row->{id}, $table_name, $row->{modification_time});
-  if (!$data) {
-    print "$table_name id "
-      . $row->{id}
-      . ' with time '
-      . $row->{modification_time}
-      . " not found in cache.\n"
-      if $verbose;
+  $sth->execute($last_id);
 
-    my $obj = Bugzilla::Attachment->new($row->{id});
+  while (my ($id, $mod_time) = $sth->fetchrow_array()) {
+    print "Processing id $id with mod_time of $mod_time.\n" if $verbose;
 
-    $data = {
-      id           => $obj->id,
-      bug_id       => $obj->bug_id,
-      creation_ts  => $obj->attached,
-      description  => $obj->description,
-      filename     => $obj->filename,
-      content_type => $obj->contenttype,
-      updated_ts   => $obj->modification_time,
-      submitter_id => $obj->attacher->id,
-      is_obsolete  => ($obj->isobsolete ? true : false),
-    };
+    # First check to see if we have a cached version with the same modification date
+    my $data = get_cache($id, $table_name, $mod_time);
+    if (!$data) {
+      print "$table_name id $id with time $mod_time not found in cache.\n"
+        if $verbose;
 
-    # Store a new copy of the data for use later
-    store_cache($obj->id, $table_name, $obj->modification_time, $data);
+      my $obj = Bugzilla::Attachment->new($id);
+
+      $data = {
+        id           => $obj->id,
+        bug_id       => $obj->bug_id,
+        creation_ts  => $obj->attached,
+        description  => $obj->description,
+        filename     => $obj->filename,
+        content_type => $obj->contenttype,
+        updated_ts   => $obj->modification_time,
+        submitter_id => $obj->attacher->id,
+        is_obsolete  => ($obj->isobsolete ? true : false),
+      };
+
+      # Store a new copy of the data for use later
+      store_cache($obj->id, $table_name, $obj->modification_time, $data);
+    }
+
+    push @attachments, $data;
+
+    $count++;
+    $last_id = $id;
   }
 
-  push @results, $data;
-
-  $count++;
-
-  # Send the rows to the server if we have a specific sized block'
-  # or we are at the last row
-  if (scalar @results == API_BLOCK_COUNT || $total == $count) {
-    send_data($table_name, \@results, $count);
-    @results = ();
-  }
+  # Send the rows to the server
+  send_data($table_name, \@attachments, $count) if @attachments;
 }
 
 ### Flags
 
 $table_name = 'flags';
-$rows
-  = $dbh->selectall_arrayref(
-  'SELECT id, modification_date FROM flags ORDER BY id',
-  {Slice => {}});
+$count      = 0;
+$last_id    = 0;
 
-$total = scalar @{$rows};
-$count = 0;
+$total = $dbh->selectrow_array('SELECT COUNT(*) FROM flags');
+print "Processing $total $table_name.\n" if $verbose;
 
-print "Processing $total flags.\n" if $verbose;
+$sth
+  = $dbh->prepare(
+  'SELECT id, modification_date FROM flags WHERE id > ? ORDER BY id LIMIT '
+    . API_BLOCK_COUNT);
 
-@results = ();
-foreach my $row (@{$rows}) {
+while ($count < $total) {
+  my @flags = ();
 
-  # First check to see if we have a cached version with the same modification date
-  my $data = get_cache($row->{id}, $table_name, $row->{modification_date});
-  if (!$data) {
-    print "$table_name id " . $row->{id} . " not found in cache.\n" if $verbose;
+  $sth->execute($last_id);
 
-    my $obj = Bugzilla::Flag->new($row->{id});
+  while (my ($id, $mod_time) = $sth->fetchrow_array()) {
+    print "Processing id $id with mod_time of $mod_time.\n" if $verbose;
 
-    $data = {
-      attachment_id => $obj->attach_id,
-      bug_id        => $obj->bug_id,
-      creation_ts   => $obj->creation_date,
-      updated_ts    => $obj->modification_date,
-      requestee_id  => $obj->requestee_id,
-      setter_id     => $obj->setter_id,
-      name          => $obj->type->name,
-      value         => $obj->status,
-    };
+    # First check to see if we have a cached version with the same modification date
+    my $data = get_cache($id, $table_name, $mod_time);
+    if (!$data) {
+      print "$table_name id $id with time $mod_time not found in cache.\n"
+        if $verbose;
 
-    # Store a new copy of the data for use later
-    store_cache($obj->id, $table_name, $obj->modification_date, $data);
+      my $obj = Bugzilla::Flag->new($id);
+
+      $data = {
+        attachment_id => $obj->attach_id,
+        bug_id        => $obj->bug_id,
+        creation_ts   => $obj->creation_date,
+        updated_ts    => $obj->modification_date,
+        requestee_id  => $obj->requestee_id,
+        setter_id     => $obj->setter_id,
+        name          => $obj->type->name,
+        value         => $obj->status,
+      };
+
+      # Store a new copy of the data for use later
+      store_cache($obj->id, $table_name, $obj->modification_date, $data);
+    }
+
+    push @flags, $data;
+
+    $count++;
+    $last_id = $id;
   }
 
-  push @results, $data;
-
-  $count++;
-
-  # Send the rows to the server if we have a specific sized block'
-  # or we are at the last row
-  if (scalar @results == API_BLOCK_COUNT || $total == $count) {
-    send_data($table_name, \@results, $count);
-    @results = ();
-  }
+  # Send the rows to the server
+  send_data($table_name, \@flags, $count) if @flags;
 }
 
 ### Tracking Flags
 
 $table_name = 'tracking_flags';
-$rows       = $dbh->selectall_arrayref(
+my $rows = $dbh->selectall_arrayref(
   'SELECT tracking_flags.name AS name, tracking_flags_bugs.bug_id AS bug_id, tracking_flags_bugs.value AS value
      FROM tracking_flags_bugs
           JOIN tracking_flags
@@ -249,9 +271,9 @@ $rows       = $dbh->selectall_arrayref(
 $total = scalar @{$rows};
 $count = 0;
 
-print "Processing $total tracking flags.\n" if $verbose;
+print "Processing $total $table_name.\n" if $verbose;
 
-@results = ();
+my @results = ();
 foreach my $row (@{$rows}) {
   my $data
     = {bug_id => $row->{bug_id}, name => $row->{name}, value => $row->{value},};
@@ -282,7 +304,7 @@ $rows       = $dbh->selectall_arrayref(
 $total = scalar @{$rows};
 $count = 0;
 
-print "Processing $total keywords.\n" if $verbose;
+print "Processing $total $table_name.\n" if $verbose;
 
 @results = ();
 foreach my $row (@{$rows}) {
@@ -311,7 +333,7 @@ $rows
 $total = scalar @{$rows};
 $count = 0;
 
-print "Processing $total see also values.\n" if $verbose;
+print "Processing $total $table_name.\n" if $verbose;
 
 @results = ();
 foreach my $row (@{$rows}) {
@@ -347,7 +369,7 @@ $rows
 $total = scalar @{$rows};
 $count = 0;
 
-print "Processing $total bug mentors.\n" if $verbose;
+print "Processing $total $table_name.\n" if $verbose;
 
 @results = ();
 foreach my $row (@{$rows}) {
@@ -376,7 +398,7 @@ $rows
 $total = scalar @{$rows};
 $count = 0;
 
-print "Processing $total bug dependency values.\n" if $verbose;
+print "Processing $total $table_name.\n" if $verbose;
 
 @results = ();
 foreach my $row (@{$rows}) {
@@ -404,7 +426,7 @@ $rows
 $total = scalar @{$rows};
 $count = 0;
 
-print "Processing $total bug regression values.\n" if $verbose;
+print "Processing $total $table_name.\n" if $verbose;
 
 @results = ();
 foreach my $row (@{$rows}) {
@@ -431,7 +453,7 @@ $rows       = $dbh->selectall_arrayref('SELECT dupe, dupe_of FROM duplicates',
 $total = scalar @{$rows};
 $count = 0;
 
-print "Processing $total bug duplicate values.\n" if $verbose;
+print "Processing $total $table_name.\n" if $verbose;
 
 @results = ();
 foreach my $row (@{$rows}) {
@@ -452,87 +474,61 @@ foreach my $row (@{$rows}) {
 ### Users
 
 $table_name = 'users';
-$rows
-  = $dbh->selectall_arrayref(
-  'SELECT userid AS id FROM profiles ORDER BY userid',
-  {Slice => {}});
+$count      = 0;
+$last_id    = 0;
 
-$total = scalar @{$rows};
-$count = 0;
+$total = $dbh->selectrow_array('SELECT COUNT(*) FROM profiles');
+print "Processing $total $table_name.\n" if $verbose;
 
-print "Processing $total users.\n" if $verbose;
+$sth
+  = $dbh->prepare(
+  'SELECT userid, modification_ts FROM profiles WHERE userid > ? ORDER BY userid LIMIT '
+    . API_BLOCK_COUNT);
 
-@results = ();
-foreach my $row (@{$rows}) {
+while ($count < $total) {
+  my @users = ();
 
-  # Determine last update timestamp for this user
-  # The profiles table does not have its own modification_time field
-  # so we have find it from the profiles_activity table and/or audit_log.
-  my ($profiles_activity_ts, $profiles_activity_epoch) = $dbh->selectrow_array(
-    'SELECT profiles_when, UNIX_TIMESTAMP(profiles_when) FROM profiles_activity WHERE userid = ? ORDER BY profiles_when DESC LIMIT 1',
-    undef, $row->{id}
-  );
-  my ($audit_log_ts, $audit_log_epoch) = $dbh->selectrow_array(
-    'SELECT at_time, UNIX_TIMESTAMP(at_time) FROM audit_log WHERE class = \'Bugzilla::User\' AND object_id = ? ORDER BY at_time DESC LIMIT 1',
-    undef, $row->{id}
-  );
+  $sth->execute($last_id);
 
-  $profiles_activity_epoch ||= 0;
-  $audit_log_epoch         ||= 0;
+  while (my ($id, $mod_time) = $sth->fetchrow_array()) {
+    print "Processing id $id with mod_time of $mod_time.\n" if $verbose;
 
-  my $modification_time;
-  if ($audit_log_epoch > $profiles_activity_epoch) {
-    $modification_time = $audit_log_ts;
-  }
-  elsif ($profiles_activity_epoch > $audit_log_epoch) {
-    $modification_time = $profiles_activity_ts;
-  }
+    # First check to see if we have a cached version with the same modification date
+    my $data = get_cache($id, $table_name, $mod_time);
+    if (!$data) {
+      print "$table_name id $id with time $mod_time not found in cache.\n"
+        if $verbose;
 
-  if ($verbose) {
-    print 'Modification time is '
-      . ($modification_time ? $modification_time : 'undefined') . "\n";
-  }
+      my $obj = Bugzilla::User->new($id);
 
-  # First check to see if we have a cached version with the same modification date
-  my $data;
-  if ($modification_time) {
-    $data = get_cache($row->{id}, $table_name, $modification_time);
-  }
+      $data = {
+        id         => $obj->id,
+        last_seen  => $obj->last_seen_date,
+        email      => $obj->email,
+        nick       => $obj->nick,
+        name       => $obj->name,
+        ldap_email => $obj->ldap_email,
+        is_new     => $obj->is_new,
+        is_staff   => ($obj->in_group('mozilla-employee-confidential') ? true : false),
+        is_trusted => ($obj->in_group('editbugs')                      ? true : false),
+      };
 
-  if (!$data) {
-    print "$table_name id " . $row->{id} . " not found in cache.\n" if $verbose;
-
-    my $obj = Bugzilla::User->new($row->{id});
-
-    $data = {
-      id         => $obj->id,
-      last_seen  => $obj->last_seen_date,
-      email      => $obj->email,
-      nick       => $obj->nick,
-      name       => $obj->name,
-      ldap_email => $obj->ldap_email,
-      is_new     => $obj->is_new,
-      is_staff   => ($obj->in_group('mozilla-employee-confidential') ? true : false),
-      is_trusted => ($obj->in_group('editbugs')                      ? true : false),
-    };
-
-    # Store a new copy of the data for use later
-    if ($modification_time) {
-      store_cache($obj->id, $table_name, $modification_time, $data);
+      # Store a new copy of the data for use later
+      store_cache($obj->id, $table_name, $obj->modification_ts, $data);
     }
+
+    push @users, $data;
+
+    $count++;
+    $last_id = $id;
   }
 
-  push @results, $data;
-
-  $count++;
-
-  # Send the rows to the server if we have a specific sized block'
-  # or we are at the last row
-  if (scalar @results == API_BLOCK_COUNT || $total == $count) {
-    send_data($table_name, \@results, $count);
-    @results = ();
-  }
+  # Send the rows to the server
+  send_data($table_name, \@users, $count) if @users;
 }
+
+# Delete lock from bmo_etl_locked
+Bugzilla->dbh_main->do('DELETE FROM bmo_etl_locked');
 
 # Functions
 
@@ -593,26 +589,18 @@ sub send_data {
     $row->{snapshot_date} = $snapshot_date;
   }
 
-  my $project_id = Bugzilla->params->{bmo_etl_project_id};
-  $project_id || die "Invalid BigQuery product ID.\n";
-
-  my $dataset_id = Bugzilla->params->{bmo_etl_dataset_id};
-  $dataset_id || die "Invalid BigQuery dataset ID.\n";
-
   my @json_rows = ();
   foreach my $row (@{$all_rows}) {
     push @json_rows, {json => $row};
   }
 
-  my $big_query = {
-    rows => \@json_rows
-  };
+  my $big_query = {rows => \@json_rows};
 
   if ($test) {
     my $filename
       = bz_locations()->{'datadir'} . '/'
-      . $file_snapshot . '_'
-      . $table . '_'
+      . $snapshot_date . '-'
+      . $table . '-'
       . $current_count . '.json';
 
     print "Writing data to $filename\n" if $verbose;
@@ -624,13 +612,10 @@ sub send_data {
     return;
   }
 
-  my $base_url = Bugzilla->params->{bmo_etl_base_url};
-  $base_url || die "Invalid BigQuery base URL.\n";
-
   my $http_headers = HTTP::Headers->new;
 
   # Do not attempt to get access token if running in test environment
-  if ($base_url !~ /^http:\/\/bigquery:/) {
+  if ($base_url !~ /^http:\/\/[^\/]+:9050/) {
     my $access_token = _get_access_token();
     $http_headers->header(Authorization => 'Bearer ' . $access_token);
   }
@@ -684,6 +669,59 @@ sub _get_access_token {
   $token_expiry = time + $result->{expires_in};
 
   return $access_token;
+}
+
+sub check_and_set_lock {
+  return if $test; # No need if just dumping test files
+
+  my $dbh_main = Bugzilla->dbh_main;
+  my $locked = $dbh_main->selectrow_array('SELECT COUNT(*) FROM bmo_etl_locked');
+  if ($locked) {
+    die "Another process has set a lock. Exiting\n";
+  }
+  $dbh_main->do('INSERT INTO bmo_etl_locked VALUES (?)', undef, 'locked');
+}
+
+sub check_for_duplicates {
+  return if $test; # no need if just dumping test files
+
+  print "Checking for duplicate data for snapshot date $snapshot_date\n"
+    if $verbose;
+
+  my $http_headers = HTTP::Headers->new;
+
+  # Do not attempt to get access token if running in test environment
+  if ($base_url !~ /^http:\/\/[^\/]+:9050/) {
+    my $access_token = _get_access_token();
+    $http_headers->header(Authorization => 'Bearer ' . $access_token);
+  }
+
+  my $full_path = "projects/$project_id/queries";
+
+  print "Querying $base_url/$full_path\n" if $verbose;
+
+  my $query
+    = {query =>
+      "SELECT count(*) FROM ${project_id}.${dataset_id}.bugs WHERE snapshot_date = '$snapshot_date'"
+    };
+
+  my $request = HTTP::Request->new('POST', "$base_url/$full_path", $http_headers);
+  $request->header('Content-Type' => 'application/json');
+  $request->content(encode_json($query));
+
+  my $res = $ua->request($request);
+  if (!$res->is_success) {
+    die 'Google Big Query query failure: ' . $res->content;
+  }
+
+  my $result = decode_json($res->content);
+
+  my $row_count = $result->{rows}->[0]->{f}->[0]->{v};
+
+  # Do not export if we have any rows with this snapshot date.
+  if ($row_count) {
+    die "Duplicate data found for snapshot date $snapshot_date\n";
+  }
 }
 
 1;
