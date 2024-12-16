@@ -1,3 +1,4 @@
+#!/usr/bin/env perl
 # This Source Code Form is subject to the terms of the Mozilla Public
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
@@ -527,8 +528,7 @@ while ($count < $total) {
   send_data($table_name, \@users, $count) if @users;
 }
 
-# Delete lock from bmo_etl_locked
-Bugzilla->dbh_main->do('DELETE FROM bmo_etl_locked');
+delete_lock();
 
 # Functions
 
@@ -546,7 +546,10 @@ sub get_cache {
 
   # First uncompress the JSON and then decode it back to Perl data
   my $data;
-  gunzip \$gzipped_data => \$data or die "gunzip failed: $GunzipError\n";
+  unless (gunzip \$gzipped_data => \$data) {
+    delete_lock();
+    die "gunzip failed: $GunzipError\n";
+  }
   return decode_json($data);
 }
 
@@ -560,7 +563,10 @@ sub store_cache {
 
   # Compress the JSON to save space in the DB
   my $gzipped_data;
-  gzip \$data => \$gzipped_data or die "gzip failed: $GzipError\n";
+  unless (gzip \$data => \$gzipped_data) {
+    delete_lock();
+    die "gzip failed: $GzipError\n";
+  }
 
   # We need to use the main DB for write operations
   my $main_dbh = Bugzilla->dbh_main;
@@ -607,7 +613,10 @@ sub send_data {
 
     my $fh = path($filename)->open('>>');
     print $fh encode_json($big_query) . "\n";
-    close $fh || die "Could not close $filename: $!\n";
+    unless (close $fh) {
+      delete_lock();
+      die "Could not close $filename: $!\n";
+    }
 
     return;
   }
@@ -631,6 +640,7 @@ sub send_data {
 
   my $res = $ua->request($request);
   if (!$res->is_success) {
+    delete_lock();
     die 'Google Big Query insert failure: ' . $res->content;
   }
 }
@@ -661,6 +671,7 @@ sub _get_access_token {
   my $res = $ua->request($request);
 
   if (!$res->is_success) {
+    delete_lock();
     die 'Google access token failure: ' . $res->content;
   }
 
@@ -680,6 +691,12 @@ sub check_and_set_lock {
     die "Another process has set a lock. Exiting\n";
   }
   $dbh_main->do('INSERT INTO bmo_etl_locked VALUES (?)', undef, 'locked');
+}
+
+# Delete lock from bmo_etl_locked
+sub delete_lock {
+  print "Deleting lock in database\n" if $verbose;
+  Bugzilla->dbh_main->do('DELETE FROM bmo_etl_locked');
 }
 
 sub check_for_duplicates {
@@ -709,8 +726,11 @@ sub check_for_duplicates {
   $request->header('Content-Type' => 'application/json');
   $request->content(encode_json($query));
 
+  print encode_json($query) . "\n" if $verbose;
+
   my $res = $ua->request($request);
   if (!$res->is_success) {
+    delete_lock();
     die 'Google Big Query query failure: ' . $res->content;
   }
 
@@ -720,6 +740,7 @@ sub check_for_duplicates {
 
   # Do not export if we have any rows with this snapshot date.
   if ($row_count) {
+    delete_lock();
     die "Duplicate data found for snapshot date $snapshot_date\n";
   }
 }
