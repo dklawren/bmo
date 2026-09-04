@@ -478,9 +478,10 @@ sub _preload_bugs_comment_edit_info {
   $self->_preload_comment_edit_info([map { @{$_->comments} } @$bugs]);
 }
 
-# Comments tagged with one of the 'collapsed_comment_tags' tags (spam, abusive,
-# etc) are hidden behind a click in the web UI, so they are left out of the API
-# response too unless the caller asks for them with
+# Comments that Bugzilla::Comment::collapsed flags (tagged with one of the
+# 'collapsed_comment_tags' tags, or authored by treeherder) are hidden behind a
+# click in the web UI, so they are left out of the API response too unless the
+# caller asks for them with
 # include_fields=_collapsed_comments. Like the other underscore-prefixed
 # include_fields values, it does not imply _default, so callers that want the
 # usual fields as well need include_fields=_default,_collapsed_comments.
@@ -2792,9 +2793,10 @@ C<comment_ids> argument, even if they are older than this date.
 
 =item C<_collapsed_comments>
 
-Comments tagged with one of the tags listed in the C<collapsed_comment_tags>
-parameter (C<spam>, C<abusive>, etc) are collapsed in the web UI, and are left
-out of the comments returned for C<ids> entirely. Passing
+Comments that are collapsed in the web UI -- those tagged with one of the tags
+listed in the C<collapsed_comment_tags> parameter (C<spam>, C<abusive>, etc), and
+those authored by treeherder -- are left out of the comments returned for C<ids>
+entirely. Passing
 C<_collapsed_comments> in C<include_fields> includes them in the response.
 
 As with the other underscore-prefixed C<include_fields> values, it does not
@@ -2907,8 +2909,9 @@ comments, and follows the same rules as C<edit_count> for hidden revisions.
 
 =item collapsed
 
-C<boolean> True if this comment is collapsed in the web UI because one of its
-tags is listed in the C<collapsed_comment_tags> parameter, False otherwise.
+C<boolean> True if this comment is collapsed in the web UI, either because one
+of its tags is listed in the C<collapsed_comment_tags> parameter or because it
+was authored by treeherder. False otherwise.
 
 This key is only present when comment tagging is enabled.
 

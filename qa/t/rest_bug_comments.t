@@ -231,6 +231,21 @@ my ($spam_comment)
 ok($spam_comment, 'collapsed comment is returned with _collapsed_comments');
 ok($spam_comment->{collapsed}, 'collapsed comment is flagged as collapsed');
 
+# GET /rest/bug?include_fields=comments is a separate code path (_bug_to_hash).
+$t->get_ok($url
+    . 'rest/bug/public_bug?include_fields=comments' => api_headers($admin_key))
+  ->status_is(200);
+@ids = map { $_->{id} } @{$t->tx->res->json->{bugs}->[0]->{comments}};
+ok(!grep({ $_ == $spam_id } @ids),
+  'collapsed comment is omitted by default from GET /rest/bug');
+
+$t->get_ok($url
+    . 'rest/bug/public_bug?include_fields=comments,_collapsed_comments' =>
+    api_headers($admin_key))->status_is(200);
+@ids = map { $_->{id} } @{$t->tx->res->json->{bugs}->[0]->{comments}};
+ok(grep({ $_ == $spam_id } @ids),
+  'collapsed comment is returned from GET /rest/bug with _collapsed_comments');
+
 # Requesting the comment by id returns it either way.
 $t->get_ok($url . "rest/bug/comment/$spam_id" => api_headers($admin_key))
   ->status_is(200)->json_is("/comments/$spam_id/id", $spam_id,

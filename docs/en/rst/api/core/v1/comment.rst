@@ -41,10 +41,10 @@ include_fields   array     Pass ``_collapsed_comments`` to include comments that
                            the usual comment fields as well.
 ===============  ========  ======================================================
 
-Comments tagged with one of the tags listed in the
-``collapsed_comment_tags`` parameter (``spam``, ``abusive``, etc) are
-collapsed in the web UI, and are left out of the comments returned for a bug
-entirely unless ``_collapsed_comments`` is requested. Comments requested by
+Comments that are collapsed in the web UI -- those tagged with one of the tags
+listed in the ``collapsed_comment_tags`` parameter (``spam``, ``abusive``, etc),
+and those authored by treeherder -- are left out of the comments returned for a
+bug entirely unless ``_collapsed_comments`` is requested. Comments requested by
 ``comment_id`` are always returned, collapsed or not.
 
 **Response**
@@ -144,10 +144,10 @@ last_change_time  datetime  The time (in Bugzilla's timezone) of the most recent
 reactions         object    An object containing reacted emoji names and
                             corresponding counts. To retrieve reacted users, use
                             :ref:`rest_get_comment_reactions`.
-collapsed         boolean   ``true`` if this comment is collapsed in the web UI
-                            because one of its tags is listed in the
-                            ``collapsed_comment_tags`` parameter, ``false``
-                            otherwise.
+collapsed         boolean   ``true`` if this comment is collapsed in the web UI,
+                            either because one of its tags is listed in the
+                            ``collapsed_comment_tags`` parameter or because it was
+                            authored by treeherder. ``false`` otherwise.
 
                             Only present when comment tagging is enabled.
 ================  ========  =====================================================
