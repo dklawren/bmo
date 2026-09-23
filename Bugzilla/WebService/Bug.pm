@@ -56,11 +56,11 @@ sub DATE_FIELDS {
     update   => []
   };
 
-  # Add date related custom fields
+  # Add datetime custom fields. Date-only fields are left out so they are
+  # passed through as YYYY-MM-DD, since converting them would append a time
+  # component that _check_date_field rejects.
   foreach my $field (Bugzilla->active_custom_fields({skip_extensions => 1})) {
-    next
-      unless ($field->type == FIELD_TYPE_DATETIME
-      || $field->type == FIELD_TYPE_DATE);
+    next unless $field->type == FIELD_TYPE_DATETIME;
     push(@{$fields->{create}}, $field->name);
     push(@{$fields->{update}}, $field->name);
   }
