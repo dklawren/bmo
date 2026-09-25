@@ -1893,8 +1893,15 @@ sub _format_cf_value {
   if ($field->type == FIELD_TYPE_BUG_ID) {
     return $self->type('int', $value);
   }
-  elsif ($field->type == FIELD_TYPE_DATETIME || $field->type == FIELD_TYPE_DATE) {
+  elsif ($field->type == FIELD_TYPE_DATETIME) {
     return defined($value) ? $self->type('dateTime', $value) : undef;
+  }
+  elsif ($field->type == FIELD_TYPE_DATE) {
+
+    # Date-only fields are returned as YYYY-MM-DD, the same format they are
+    # accepted in, like deadline. Converting them to dateTime would append
+    # a time and time zone that the value does not have.
+    return defined($value) ? $self->type('string', $value) : undef;
   }
   elsif ($field->type == FIELD_TYPE_MULTI_SELECT) {
     return [map { $self->type('string', $_) } @{$value}];
