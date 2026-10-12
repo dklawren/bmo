@@ -20,6 +20,8 @@ use Bugzilla::Logging;
 use Bugzilla::User;
 use Bugzilla::User::Setting;
 
+use List::Util qw(all);
+
 our $VERSION = '0.01';
 
 use constant MAX_MENTIONS => 10;
@@ -107,7 +109,7 @@ sub bug_start_of_update {
 
   # Runs after the explicit needinfo handling so that the duplicate check
   # sees any flags that were just requested through the form.
-  _process_mentions($args->{bug}) if $args->{old_bug};
+  _process_mentions($args->{bug}, $args->{old_bug}) if $args->{old_bug};
 }
 
 # Clear the needinfo? flag if comment is being given by
@@ -307,12 +309,17 @@ sub _users_for_mentions {
 # needinfo type isn't multiplicable and a flag exists) is only CC'd.
 #
 # Safeguards against misuse:
+# - only comments made in the web UI count, so bots and API clients posting
+#   commit messages, code or logs can't CC people by accident
 # - only editbugs users can trigger mentions; for everyone else they are text
 # - only the first MAX_MENTIONS distinct nicknames per update are processed
 # - users who can't already see the bug are skipped, so a mention (or a typo,
-#   or a squatted nickname) can never grant access to a restricted bug
+#   or a squatted nickname) can never grant access to a restricted bug; that
+#   includes groups being added to the bug in this same update
 sub _process_mentions {
-  my ($bug) = @_;
+  my ($bug, $old_bug) = @_;
+  return unless Bugzilla->usage_mode == USAGE_MODE_BROWSER;
+
   # Lowercased nick => true if mentioned in at least one public comment.
   my %public;
 
@@ -331,10 +338,18 @@ sub _process_mentions {
   my $user = Bugzilla->user;
   return unless $user->in_group('editbugs', $bug->product_id);
 
+  # can_see_bug reads the groups stored in the database, which don't yet
+  # include groups added by this update, so check those separately.
+  my %old_groups = map { $_->id => 1 } @{$old_bug->groups_in};
+  my @added_groups
+    = map { $_->name } grep { !$old_groups{$_->id} } @{$bug->groups_in};
+
   my @mentioned = grep {
-         $_->id != $user->id
-      && ($public{lc $_->nick} || $_->is_insider)
-      && $_->can_see_bug($bug->id)
+    my $mentioned = $_;
+         $mentioned->id != $user->id
+      && ($public{lc $mentioned->nick} || $mentioned->is_insider)
+      && $mentioned->can_see_bug($bug->id)
+      && all { $mentioned->in_group($_) } @added_groups
   } _users_for_mentions(@nicks);
   return unless @mentioned;
 

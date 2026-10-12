@@ -55,7 +55,11 @@ is([$extract->("~~~\n\@unclosed\n\@more")], [], 'unclosed fence runs to end');
   sub id           { $_[0]{id} }
   sub nick         { $_[0]{nick} }
   sub login        { "$_[0]{nick}\@example.com" }
-  sub in_group     { $_[0]{editbugs} }
+  sub in_group {
+    my ($self, $group) = @_;
+    return $self->{editbugs} if $group eq 'editbugs';
+    return scalar grep { $_ eq $group } @{$self->{groups} || []};
+  }
   sub is_insider   { $_[0]{insider} }
   sub can_see_bug  { $_[0]{sees_bug} // 1 }
   sub needinfo_blocked { 0 }
@@ -65,6 +69,7 @@ is([$extract->("~~~\n\@unclosed\n\@more")], [], 'unclosed fence runs to end');
     my ($class, $text, %type) = @_;
     bless {
       added_comments => [{thetext => $text}],
+      groups         => [],
       cc             => [],
       needinfo       => [],
       type => bless({flags => [], multiplicable => 1, %type}, 'FakeType'),
@@ -73,6 +78,7 @@ is([$extract->("~~~\n\@unclosed\n\@more")], [], 'unclosed fence runs to end');
   sub id                     {1}
   sub product_id             {1}
   sub flag_types             { [$_[0]{type}] }
+  sub groups_in              { $_[0]{groups} }
   sub check_can_change_field { {allowed => 1} }
   sub add_cc {
     my ($self, $user) = @_;
@@ -98,19 +104,26 @@ is([$extract->("~~~\n\@unclosed\n\@more")], [], 'unclosed fence runs to end');
   package FakeFlag;
   sub status       { $_[0]{status} }
   sub requestee_id { $_[0]{requestee_id} }
+
+  package FakeGroup;
+  sub new  { my ($class, $id, $name) = @_; bless {id => $id, name => $name}, $class }
+  sub id   { $_[0]{id} }
+  sub name { $_[0]{name} }
 }
 
 my %users = map { $_->nick => $_ } (
   FakeUser->new(id => 2, nick => 'alice'),
-  FakeUser->new(id => 3, nick => 'bob'),
+  FakeUser->new(id => 3, nick => 'bob', groups => ['core-security']),
   FakeUser->new(id => 4, nick => 'hidden', sees_bug => 0),
   FakeUser->new(id => 6, nick => 'boom', cc_fails => 1),
   map { FakeUser->new(id => 10 + $_, nick => "u$_") } 1 .. 12,
 );
 my $commenter = FakeUser->new(id => 1, nick => 'me', editbugs => 1);
 my @looked_up;
+my $usage_mode = Bugzilla::Constants::USAGE_MODE_BROWSER;
 
-my $mock_bugzilla = mock 'Bugzilla' => (override => [user => sub {$commenter}]);
+my $mock_bugzilla = mock 'Bugzilla' => (
+  override => [user => sub {$commenter}, usage_mode => sub {$usage_mode}]);
 my $mock_ext = mock 'Bugzilla::Extension::Needinfo' => (
   override => [
     _users_for_mentions => sub {
@@ -120,7 +133,11 @@ my $mock_ext = mock 'Bugzilla::Extension::Needinfo' => (
   ],
 );
 
-my $process = \&Bugzilla::Extension::Needinfo::_process_mentions;
+# The bug as it was before the update; it has no groups unless a test adds some.
+my $old_bug = FakeBug->new('');
+my $process = sub {
+  Bugzilla::Extension::Needinfo::_process_mentions($_[0], $old_bug);
+};
 
 my $bug = FakeBug->new('@alice and @bob please look, cc @me');
 $process->($bug);
@@ -159,6 +176,36 @@ ok(lives { $process->($bug) },
   'a failing CC (e.g. strict_isolation) does not throw');
 is($bug->{cc},       ['alice'],             '... that user is skipped');
 is($bug->{needinfo}, ['alice@example.com'], '... others still processed');
+
+$bug = FakeBug->new('@alice @bob');
+$bug->{added_comments}[0]{isprivate} = 1;
+$users{bob}{insider} = 1;
+$process->($bug);
+is($bug->{cc},       ['bob'],             'private comment: only insiders are CCd');
+is($bug->{needinfo}, ['bob@example.com'], '... and needinfod');
+$users{bob}{insider} = 0;
+
+my $security = FakeGroup->new(1, 'core-security');
+$bug = FakeBug->new('@alice @bob');
+$bug->{groups} = [$security];
+$process->($bug);
+is($bug->{cc}, ['bob'], 'group added in this update: only its members are CCd');
+is($bug->{needinfo}, ['bob@example.com'], '... and needinfod');
+
+$old_bug->{groups} = [$security];
+$bug = FakeBug->new('@alice');
+$bug->{groups} = [$security];
+$process->($bug);
+is($bug->{cc}, ['alice'], 'existing group is left to can_see_bug');
+$old_bug->{groups} = [];
+
+$usage_mode = Bugzilla::Constants::USAGE_MODE_REST;
+@looked_up = ();
+$bug = FakeBug->new('@alice');
+$process->($bug);
+is(\@looked_up,      [], 'no lookup for comments made through the API');
+is($bug->{cc},       [], 'no CC for comments made through the API');
+$usage_mode = Bugzilla::Constants::USAGE_MODE_BROWSER;
 
 $commenter->{editbugs} = 0;
 @looked_up = ();
