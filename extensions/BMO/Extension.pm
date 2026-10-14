@@ -1385,10 +1385,13 @@ sub db_schema_abstract_schema {
       bmo_etl_cache_uniq_idx => {FIELDS => ['id', 'table_name'], TYPE => 'UNIQUE'}
     ],
   };
+  # value holds the id of the export run that owns the lock. updated_ts is a
+  # heartbeat; a lock that stops being updated was left by a run that died.
   $args->{schema}->{bmo_etl_locked} = {
     FIELDS => [
       value       => {TYPE => 'VARCHAR(20)', NOTNULL => 1,},
       creation_ts => {TYPE => 'DATETIME',},
+      updated_ts  => {TYPE => 'DATETIME',},
     ],
   };
 
@@ -1592,6 +1595,11 @@ sub install_update_db {
   if (!$dbh->bz_column_info('bmo_etl_locked', 'creation_ts')) {
     $dbh->bz_add_column('bmo_etl_locked',
       'creation_ts' => {TYPE => 'DATETIME'});
+  }
+
+  # Add bmo_etl_locked.updated_ts column
+  if (!$dbh->bz_column_info('bmo_etl_locked', 'updated_ts')) {
+    $dbh->bz_add_column('bmo_etl_locked', 'updated_ts' => {TYPE => 'DATETIME'});
   }
 
   # Add unique index for id and table name for bmo_etl_cache
