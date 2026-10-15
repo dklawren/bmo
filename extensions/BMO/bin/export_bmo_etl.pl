@@ -1054,8 +1054,21 @@ sub check_and_set_lock {
       logger('Removed stale lock left by a previous run that did not finish.');
     }
 
-    my $owner = $dbh_main->selectrow_array('SELECT value FROM bmo_etl_locked');
-    last if !$owner;
+    # The unique index on name allows only one lock row, so if two runs get
+    # here at the same time only one insert succeeds.
+    my $inserted = $dbh_main->do(
+      'INSERT IGNORE INTO bmo_etl_locked (value, creation_ts, updated_ts)
+       VALUES (?, NOW(), NOW())', undef, $run_id
+    );
+    if ($inserted > 0) {
+      logger("Set new lock for run $run_id.", DEBUG_OUTPUT);
+      return;
+    }
+
+    # The lock may have been released since the insert. Waiting as usual
+    # keeps this loop bounded if the insert keeps failing for another reason.
+    my $owner = $dbh_main->selectrow_array('SELECT value FROM bmo_etl_locked')
+      // 'unknown';
 
     if ($waited >= $lock_wait) {
       die "Another process ($owner) has set a lock. Exiting\n";
@@ -1065,13 +1078,6 @@ sub check_and_set_lock {
     sleep LOCK_POLL_INTERVAL;
     $waited += LOCK_POLL_INTERVAL;
   }
-
-  logger("Setting new lock for run $run_id.", DEBUG_OUTPUT);
-
-  $dbh_main->do(
-    'INSERT INTO bmo_etl_locked (value, creation_ts, updated_ts) VALUES (?, NOW(), NOW())',
-    undef, $run_id
-  );
 }
 
 # Refresh the lock so other runs know this one is still alive. Dies if the
@@ -1219,21 +1225,44 @@ sub publish_snapshot {
 
   logger("Publishing snapshot date $snapshot_date.");
 
+  # snapshot_exists() ran when this run started, but a transaction submitted
+  # by an earlier run can keep going in BigQuery after that run died and
+  # commit later. So every insert also checks for the snapshot, and fails the
+  # whole transaction if it is already there. bugs goes last, since the
+  # check looks at bugs and must not see the rows this transaction adds.
+  my $already_published
+    = "IF(EXISTS(SELECT 1 FROM `${project_id}.${dataset_id}.bugs` "
+    . "WHERE snapshot_date = '$snapshot_date'), "
+    . "ERROR('Snapshot date $snapshot_date was already exported'), TRUE)";
+
   my @statements;
-  foreach my $table (BQ_TABLES) {
+  foreach my $table ((grep { $_ ne 'bugs' } BQ_TABLES), 'bugs') {
     my $columns = join ', ', map {"`$_`"} @{$table_columns{$table}};
     push @statements,
-      "INSERT INTO `${project_id}.${dataset_id}.${table}` ($columns) "
-      . "SELECT $columns FROM `${project_id}.${dataset_id}.$staging_tables{$table}`;";
+        "INSERT INTO `${project_id}.${dataset_id}.${table}` ($columns) "
+      . "SELECT $columns FROM `${project_id}.${dataset_id}.$staging_tables{$table}` "
+      . "WHERE $already_published;";
   }
 
   # Make sure no other run has taken over before making the data visible
   refresh_lock(1);
 
-  run_bq_query(join "\n", 'BEGIN TRANSACTION;',
-    @statements, 'COMMIT TRANSACTION;');
+  try {
+    run_bq_query(join "\n", 'BEGIN TRANSACTION;',
+      @statements, 'COMMIT TRANSACTION;');
+    logger("Snapshot date $snapshot_date published.");
+  }
+  catch {
+    my $error = $_;
 
-  logger("Snapshot date $snapshot_date published.");
+    # The snapshot is there if the guard above fired, or if this run's
+    # transaction committed but waiting for the result failed. Either way
+    # it was published exactly once, so the run has nothing left to do.
+    my $exists = try { snapshot_exists() } catch {0};
+    die $error if !$exists;
+
+    logger("Snapshot date $snapshot_date is already in BigQuery. Nothing to do.");
+  };
 }
 
 # Drop any staging tables created by this run. Failures are only logged,

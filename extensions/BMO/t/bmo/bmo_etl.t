@@ -248,6 +248,14 @@ $dbh->do(
 ($output, $error, $rv) = capture { system @cmd; };
 ok($rv, 'Export should fail while another live export holds the lock');
 
+# Only one lock row can exist, so two runs starting at once cannot both
+# take the lock
+my $second_lock = $dbh->do(
+  'INSERT IGNORE INTO bmo_etl_locked (value, creation_ts, updated_ts) VALUES (?, NOW(), NOW())',
+  undef, 'second_run'
+);
+ok(!($second_lock > 0), 'A second lock cannot be set while one is held');
+
 # Simulate a run that was killed: its lock stopped being refreshed an hour
 # ago and it left a staging table behind
 $dbh->do('DELETE FROM bmo_etl_locked');
