@@ -12,6 +12,7 @@ use warnings;
 
 use base qw(Bugzilla::Extension);
 
+use Bugzilla::Bug;
 use Bugzilla::Constants;
 use Bugzilla::Error;
 use Bugzilla::Flag;
@@ -303,6 +304,51 @@ sub _users_for_mentions {
   return @{Bugzilla::User->new_from_list(\@ids)};
 }
 
+# Returns the users a set of new comments ({thetext, isprivate} hashes) on
+# $bug would CC and needinfo, applying the safeguards described above
+# _process_mentions. Shared by saving and the comment preview so the preview
+# can't disagree with what actually happens. $old_bug is only passed when
+# saving, to account for groups added in the same update.
+sub _mentioned_users {
+  my ($bug, $comments, $old_bug) = @_;
+  return () unless Bugzilla->params->{needinfo_mentions_enabled};
+
+  # Lowercased nick => true if mentioned in at least one public comment.
+  my %public;
+
+  # The first MAX_MENTIONS distinct lowercased nicks, in order of appearance.
+  my @nicks;
+
+  foreach my $comment (@$comments) {
+    foreach my $nick (map {lc} _extract_mentions($comment->{thetext})) {
+      push @nicks, $nick if !exists $public{$nick} && @nicks < MAX_MENTIONS;
+      $public{$nick} ||= !$comment->{isprivate};
+    }
+  }
+  return () unless @nicks;
+
+  # Checked after parsing so updates without mentions skip the group lookup.
+  my $user = Bugzilla->user;
+  return () unless $user->in_group('editbugs', $bug->product_id);
+
+  # can_see_bug reads the groups stored in the database, which don't yet
+  # include groups added by this update, so check those separately.
+  my @added_groups;
+  if ($old_bug) {
+    my %old_groups = map { $_->id => 1 } @{$old_bug->groups_in};
+    @added_groups
+      = map { $_->name } grep { !$old_groups{$_->id} } @{$bug->groups_in};
+  }
+
+  return grep {
+    my $mentioned = $_;
+         $mentioned->id != $user->id
+      && ($public{lc $mentioned->nick} || $mentioned->is_insider)
+      && $mentioned->can_see_bug($bug->id)
+      && all { $mentioned->in_group($_) } @added_groups
+  } _users_for_mentions(@nicks);
+}
+
 # GitHub-style mentions: each @nickname in a new comment is CC'd and gets a
 # needinfo request. Mentions never block the comment from being saved; anyone
 # who can't be needinfo'd (blocked, already asked, no permission, or the
@@ -316,41 +362,14 @@ sub _users_for_mentions {
 # - users who can't already see the bug are skipped, so a mention (or a typo,
 #   or a squatted nickname) can never grant access to a restricted bug; that
 #   includes groups being added to the bug in this same update
+# - admins can switch the whole feature off with the needinfo_mentions_enabled
+#   param
 sub _process_mentions {
   my ($bug, $old_bug) = @_;
   return unless Bugzilla->usage_mode == USAGE_MODE_BROWSER;
 
-  # Lowercased nick => true if mentioned in at least one public comment.
-  my %public;
-
-  # The first MAX_MENTIONS distinct lowercased nicks, in order of appearance.
-  my @nicks;
-
-  foreach my $comment (@{$bug->{added_comments} || []}) {
-    foreach my $nick (map {lc} _extract_mentions($comment->{thetext})) {
-      push @nicks, $nick if !exists $public{$nick} && @nicks < MAX_MENTIONS;
-      $public{$nick} ||= !$comment->{isprivate};
-    }
-  }
-  return unless @nicks;
-
-  # Checked after parsing so updates without mentions skip the group lookup.
-  my $user = Bugzilla->user;
-  return unless $user->in_group('editbugs', $bug->product_id);
-
-  # can_see_bug reads the groups stored in the database, which don't yet
-  # include groups added by this update, so check those separately.
-  my %old_groups = map { $_->id => 1 } @{$old_bug->groups_in};
-  my @added_groups
-    = map { $_->name } grep { !$old_groups{$_->id} } @{$bug->groups_in};
-
-  my @mentioned = grep {
-    my $mentioned = $_;
-         $mentioned->id != $user->id
-      && ($public{lc $mentioned->nick} || $mentioned->is_insider)
-      && $mentioned->can_see_bug($bug->id)
-      && all { $mentioned->in_group($_) } @added_groups
-  } _users_for_mentions(@nicks);
+  my @mentioned
+    = _mentioned_users($bug, $bug->{added_comments} || [], $old_bug);
   return unless @mentioned;
 
   my ($type) = grep { $_->name eq 'needinfo' } @{$bug->flag_types};
@@ -387,6 +406,23 @@ sub _cc_and_needinfo {
     [{type_id => $type->id, status => '?', requestee => $mentioned->login}]);
 }
 
+# Lets the comment preview list who saving the comment would CC and needinfo,
+# so a stray @word is caught before the comment is submitted. The comment
+# editor sends mention_bug_id (and mention_is_private) only for new comments
+# on an existing bug, the only case _process_mentions handles.
+sub webservice_bug_render_comment {
+  my ($self, $args) = @_;
+  my $params = $args->{params};
+  return unless $params->{mention_bug_id};
+
+  my $bug = Bugzilla::Bug->check($params->{mention_bug_id});
+  my @mentioned = _mentioned_users($bug,
+    [{thetext => $params->{text}, isprivate => $params->{mention_is_private}}]);
+
+  $args->{result}->{mentions}
+    = [map { +{nick => $_->nick, name => $_->name} } @mentioned];
+}
+
 sub _check_requestee {
   my ($requestee) = @_;
   my $user
@@ -400,6 +436,12 @@ sub _check_requestee {
   ThrowUserError(
     $blocked_editbugs ? 'needinfo_blocked_editbugs' : 'needinfo_blocked',
     {requestee => $user});
+}
+
+sub config_add_panels {
+  my ($self, $args) = @_;
+  my $modules = $args->{panel_modules};
+  $modules->{Needinfo} = "Bugzilla::Extension::Needinfo::Config";
 }
 
 sub object_end_of_create {

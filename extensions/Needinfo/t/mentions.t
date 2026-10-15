@@ -54,6 +54,7 @@ is([$extract->("~~~\n\@unclosed\n\@more")], [], 'unclosed fence runs to end');
   sub new          { my ($class, %args) = @_; bless {%args}, $class }
   sub id           { $_[0]{id} }
   sub nick         { $_[0]{nick} }
+  sub name         { ucfirst $_[0]{nick} }
   sub login        { "$_[0]{nick}\@example.com" }
   sub in_group {
     my ($self, $group) = @_;
@@ -121,9 +122,15 @@ my %users = map { $_->nick => $_ } (
 my $commenter = FakeUser->new(id => 1, nick => 'me', editbugs => 1);
 my @looked_up;
 my $usage_mode = Bugzilla::Constants::USAGE_MODE_BROWSER;
+my %params = (needinfo_mentions_enabled => 1);
 
 my $mock_bugzilla = mock 'Bugzilla' => (
-  override => [user => sub {$commenter}, usage_mode => sub {$usage_mode}]);
+  override => [
+    user       => sub {$commenter},
+    usage_mode => sub {$usage_mode},
+    params     => sub { \%params },
+  ]
+);
 my $mock_ext = mock 'Bugzilla::Extension::Needinfo' => (
   override => [
     _users_for_mentions => sub {
@@ -206,6 +213,50 @@ $process->($bug);
 is(\@looked_up,      [], 'no lookup for comments made through the API');
 is($bug->{cc},       [], 'no CC for comments made through the API');
 $usage_mode = Bugzilla::Constants::USAGE_MODE_BROWSER;
+
+$params{needinfo_mentions_enabled} = 0;
+@looked_up = ();
+$bug = FakeBug->new('@alice');
+$process->($bug);
+is(\@looked_up, [], 'no lookup when needinfo_mentions_enabled is off');
+is($bug->{cc},  [], 'no CC when needinfo_mentions_enabled is off');
+$params{needinfo_mentions_enabled} = 1;
+
+# The comment preview lists the users that saving would CC and needinfo.
+my $preview_bug = FakeBug->new('');
+my $mock_bug    = mock 'Bugzilla::Bug' =>
+  (override => [check => sub {$preview_bug}]);
+my $render = sub {
+  my ($params) = @_;
+  my $result = {html => ''};
+  Bugzilla::Extension::Needinfo->webservice_bug_render_comment(
+    {params => $params, result => $result});
+  return $result;
+};
+
+is(
+  $render->({text => '@alice @hidden @me', mention_bug_id => 1})->{mentions},
+  [{nick => 'alice', name => 'Alice'}],
+  'preview lists the users a save would notify'
+);
+is($preview_bug->{cc}, [], '... without changing the bug');
+
+$users{bob}{insider} = 1;
+is(
+  $render->({text => '@alice @bob', mention_bug_id => 1, mention_is_private => 1})
+    ->{mentions},
+  [{nick => 'bob', name => 'Bob'}],
+  'preview of a private comment lists only insiders'
+);
+$users{bob}{insider} = 0;
+
+ok(!exists $render->({text => '@alice'})->{mentions},
+  'no mentions without mention_bug_id (e.g. a new bug or an edited comment)');
+
+$params{needinfo_mentions_enabled} = 0;
+is($render->({text => '@alice', mention_bug_id => 1})->{mentions},
+  [], 'preview lists nobody when needinfo_mentions_enabled is off');
+$params{needinfo_mentions_enabled} = 1;
 
 $commenter->{editbugs} = 0;
 @looked_up = ();
