@@ -781,7 +781,7 @@ Bugzilla.CommentEditor = class CommentEditor extends Bugzilla.TextEditor {
     const form = this.$textarea.form;
     const bugId = BUGZILLA.bug_id ?? form?.elements.namedItem('bugid')?.value;
 
-    if (bugId) {
+    if (bugId && this.$textarea.name === 'comment') {
       params.mention_bug_id = bugId;
       params.mention_is_private = !!(
         form?.elements.namedItem('comment_is_private')?.checked ||
