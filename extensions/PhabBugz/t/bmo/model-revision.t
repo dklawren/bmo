@@ -318,6 +318,48 @@ sub load { return Revision->new_from_query({phids => [$raw->{phid}]}) }
   );
 }
 
+# update skips differential.revision.edit when nothing would change, as
+# Phabricator still bumps the modified date for an empty edit
+{
+  my $revision = load();
+  $conduit->reset_calls;
+  ok(!defined $revision->update, 'update with no changes returns undef');
+  is($conduit->call_count('differential.revision.edit'),
+    0, 'no edit sent without pending changes');
+
+  $revision->add_project(undef);
+  $revision->update;
+  is($conduit->call_count('differential.revision.edit'),
+    0, 'no edit sent for an empty projects.add list');
+
+  $revision->set_subscribers([$reviewer_phab->{phid}, $subscriber->{phid}]);
+  $revision->update;
+  is($conduit->call_count('differential.revision.edit'),
+    0, 'no edit sent when the subscribers already match');
+
+  $revision->add_project(undef);
+  $revision->add_comment('Only change');
+  $revision->update;
+  is_deeply(
+    [$conduit->transactions_for($raw->{phid})],
+    [{type => 'comment', value => 'Only change'}],
+    'empty add/remove lists are dropped from a real edit'
+  );
+}
+
+# set_subscribers to an empty list still clears existing subscribers
+{
+  my $revision = load();
+  $conduit->reset_calls;
+  $revision->set_subscribers([]);
+  $revision->update;
+  is_deeply(
+    [$conduit->transactions_for($raw->{phid})],
+    [{type => 'subscribers.set', value => []}],
+    'subscribers.set with an empty list is sent'
+  );
+}
+
 # make_private
 {
   my $revision = load();

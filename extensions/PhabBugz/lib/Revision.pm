@@ -26,7 +26,7 @@ use Bugzilla::Extension::PhabBugz::Project;
 use Bugzilla::Extension::PhabBugz::Repository;
 use Bugzilla::Extension::PhabBugz::Types qw(:types);
 use Bugzilla::Extension::PhabBugz::User;
-use Bugzilla::Extension::PhabBugz::Util qw(request);
+use Bugzilla::Extension::PhabBugz::Util qw(remove_noop_transactions request);
 
 #########################
 #    Initialization     #
@@ -308,6 +308,11 @@ sub update {
     );
   }
 
+  # Phabricator records an edit, and bumps the revision's modified date, even
+  # when no transactions are sent, so only call Conduit if something changed.
+  $data->{transactions} = remove_noop_transactions($data->{transactions});
+  return undef unless @{$data->{transactions}};
+
   my $result = request('differential.revision.edit', $data);
 
   return $result;
@@ -533,6 +538,19 @@ sub remove_subscriber {
 
 sub set_subscribers {
   my ($self, $subscribers) = @_;
+
+  # Leave the subscribers alone if they already match.
+  my $current
+    = $self->subscribers_raw && $self->subscribers_raw->{subscriberPHIDs};
+  if ($current) {
+    my %current = map { $_ => 1 } @$current;
+    my %wanted  = map { $_ => 1 } @$subscribers;
+    if (keys %current == keys %wanted && !grep { !$current{$_} } keys %wanted) {
+      delete $self->{set_subscribers};
+      return;
+    }
+  }
+
   $self->{set_subscribers} = $subscribers;
 }
 
