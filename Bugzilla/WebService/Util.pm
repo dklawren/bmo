@@ -280,7 +280,7 @@ sub validate {
   # that match.
   $params = $params_type->coerce($params);
   if (my $type_error = $params_type->validate($params)) {
-    FATAL("validate() found type error: $type_error");
+    WARN("validate() found type error: $type_error");
     ThrowUserError('invalid_params', {type_error => $type_error}) if $type_error;
   }
 
@@ -321,7 +321,7 @@ sub merge_request_params {
   # request body. Query-string/form-body values win on a key collision,
   # matching the legacy REST layer (see fix_credentials/_retrieve_json_params
   # in Bugzilla::WebService::Server::REST) and the documented behavior in
-  # docs/en/rst/api/core/v1/general.rst.
+  # docs/en/md/api/core/v1/general.md.
   #
   # A param's type must not depend on how many times it was sent: ->to_hash
   # returns a scalar for one occurrence and an arrayref for two. Callers
