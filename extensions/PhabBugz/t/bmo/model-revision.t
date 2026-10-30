@@ -360,6 +360,24 @@ sub load { return Revision->new_from_query({phids => [$raw->{phid}]}) }
   );
 }
 
+# set_subscribers still sends the edit when Conduit truncated the list
+{
+  my $truncated = $conduit->add_revision(revision_obj(
+    author_phid => $author_phab->{phid},
+    subscribers => [$subscriber->{phid}],
+  ));
+  $truncated->{attachments}{subscribers}{subscriberCount} = 12;
+  my $revision = $conduit->load_revision($truncated);
+  $conduit->reset_calls;
+  $revision->set_subscribers([$subscriber->{phid}]);
+  $revision->update;
+  is_deeply(
+    [$conduit->transactions_for($truncated->{phid})],
+    [{type => 'subscribers.set', value => [$subscriber->{phid}]}],
+    'subscribers.set is sent when subscriberPHIDs is truncated'
+  );
+}
+
 # make_private
 {
   my $revision = load();

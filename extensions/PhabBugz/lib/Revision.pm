@@ -539,10 +539,11 @@ sub remove_subscriber {
 sub set_subscribers {
   my ($self, $subscribers) = @_;
 
-  # Leave the subscribers alone if they already match.
+  # Leave the subscribers alone if they already match. Conduit returns at
+  # most 10 subscriberPHIDs, so only trust the list when it is complete.
   my $current
     = $self->subscribers_raw && $self->subscribers_raw->{subscriberPHIDs};
-  if ($current) {
+  if ($current && @$current == ($self->subscriber_count // 0)) {
     my %current = map { $_ => 1 } @$current;
     my %wanted  = map { $_ => 1 } @$subscribers;
     if (keys %current == keys %wanted && !grep { !$current{$_} } keys %wanted) {
